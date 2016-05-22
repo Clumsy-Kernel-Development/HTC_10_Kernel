@@ -5,11 +5,11 @@ dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 # Destination Directory
 dest=~/Output/HTC10_Kernel
 # Modules
-moudles=~/Output/HTC10_Modules
+modules=~/Output/HTC10_Modules
 # zImage
 zImage=~/Output/HTC10_zImage
 # Configuration Name
-config=msm_defconfig
+config=clumsy_defconfig
 # git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9
 
 #Set Path, cross compile and user
@@ -31,7 +31,7 @@ read -p "Would you like to clean (y/n)? " -n 1 -r
 echo    
 if [[ ! $REPLY =~ ^[Nn]$ ]]
 then
-    rm -r $dest  > /dev/null
+    make O=$dest clean
 fi
 
 #Set Local Version String to kernel configuration
@@ -50,7 +50,7 @@ echo
    
 if [[ $REPLY =~ ^[Yy]$ ]]
 then
-    make menuconfig
+    make O=$dest menuconfig
 fi 
 
 # Make
@@ -71,8 +71,8 @@ echo
 
 # Get the modules
 echo "Moving modules to $modules"
-mkdir -p $moudles
-find $dest -name '*ko' -exec cp '{}' $moudles \;
+mkdir -p $modules
+find $dest -name '*ko' -exec cp '{}' $modules \;
 
 # Copy Image
 echo "Moving Image.gz-dtb to $zImage"
