@@ -1,5 +1,0 @@
-config HTC_MSM_SERIAL
-    bool "HTC msm serial number"
-    default y
-    help
-      Say yes to enable get msm serial number.
