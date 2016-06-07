@@ -85,6 +85,7 @@ extern void dwc3_otg_set_id_state(int id);
 extern void dwc3_pd_vbus_ctrl(int on);
 extern int dwc3_pd_drswap(int new_role);
 extern int usb_set_dwc_property(int prop_type,unsigned int value);
+extern void usb_downgrade_func(void);
 
 DECLARE_COMPLETION(pr_swap_rsp);
 DECLARE_COMPLETION(dr_swap_rsp);
@@ -1196,6 +1197,11 @@ void pd_cc_status_default_func(u8 cc_status)
 	pr_info("cc status 0x%x\n", cc_status);
 #endif
 	pr_info("cc status 0x%x\n", cc_status);
+	if ((cc_status == 0x20) || (cc_status == 0x02)) {
+		pr_info("%s: open e-mark cable in\n", __func__);
+		ohio_set_data_value(OHIO_EMARKER, 1);
+	}
+	usb_downgrade_func();
 }
 
 

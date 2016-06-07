@@ -330,3 +330,15 @@
 		status = "disabled";
 	};
 };
+
+&rpm_bus {
+	rpm-regulator-ldoa27 {
+		status = "okay";
+		pm8994_l27: regulator-l27 {
+			regulator-min-microvolt = <1050000>;
+			regulator-max-microvolt = <1050000>;
+			qcom,init-voltage = <1050000>;
+			status = "okay";
+		};
+	};
+};

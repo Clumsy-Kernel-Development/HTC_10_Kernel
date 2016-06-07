@@ -777,7 +777,7 @@ void cable_disconnect(void *data)
 	ohio_hardware_disable_vconn();
 	
 	wake_unlock(&ohio->ohio_lock); 
-	wake_lock_timeout(&ohio->ohio_lock, 2 * HZ); 
+	
 }
 
 void update_pwr_sink_caps(void){
@@ -982,6 +982,16 @@ void dfp_downgrade_usb20(void)
 }
 
 extern int usb_lock_speed;
+void usb_downgrade_func(void)
+{
+	ohio_debug_dump();
+	
+	if (ohio_get_data_value(OHIO_PMODE) == MODE_DFP && usb_lock_host_speed)
+		dfp_downgrade_usb20();
+	if (ohio_get_data_value(OHIO_PMODE) == MODE_UFP && usb_lock_speed)
+		ufp_switch_usb_speed(0);
+}
+
 void ohio_main_process(void)
 {
 	
@@ -1010,40 +1020,6 @@ void ohio_main_process(void)
 			pr_info("%s: UFP(%d) FW version 0x%02x\n",
 					__func__, val & DFP_OR_UFP, ohio->fw_version);
 
-			ret = ohio_read_reg(OHIO_SLVAVE_I2C_ADDR, POWER_DOWN_CTRL, &val);
-			if (ret < 0) {
-				pr_err("%s : cannot read POWER_DOWN_CTRL\n", __func__);
-				goto exit;
-			}
-			pr_info("%s(%d): POWER_DOWN_CTRL=0x%02x\n", __func__, __LINE__, val);
-
-			switch (val & 0xfc) {
-				case 0x80:
-				case 0x10:
-					ohio->fake_irq_counter = 0;
-					pr_info("%s: Default USB cable\n", __func__);
-					break;
-				case 0x40:
-				case 0x08:
-					ohio->fake_irq_counter = 0;
-					pr_info("%s: 5V 1.5A cable\n", __func__);
-					break;
-				case 0x20:
-				case 0x04:
-					ohio->fake_irq_counter = 0;
-					pr_info("%s: 5V 3A cable\n", __func__);
-					break;
-				default:
-					pr_info("%s: non standard cable\n", __func__);
-					ohio->non_standard_flag = 1;
-					ohio->fake_irq_counter++;
-					ohio->prole = PR_SINK;
-					ohio->drole = DR_DEVICE;
-					ohio->pmode = MODE_UFP;
-					dual_role_instance_changed(ohio->ohio_dual_role_instance);
-					goto exit;
-			}
-
 			ohio->prole = PR_SINK;
 			ohio->drole = DR_DEVICE;
 			ohio->pmode = MODE_UFP;
@@ -1051,7 +1027,6 @@ void ohio_main_process(void)
 		} else {
 			wake_lock(&ohio->ohio_lock); 
 			
-			ohio->fake_irq_counter = 0;
 			ohio->prole = UNKNOWN_POWER_ROLE;
 			ohio->pmode = MODE_DFP;
 			pr_info("%s: DFP(%d) FW version 0x%02x\n",
@@ -1101,21 +1076,6 @@ void ohio_main_process(void)
 		goto exit;
 	}
 
-	
-	msleep(200);
-	val = OhioReadReg(NEW_CC_STATUS);
-	pr_debug("%s: cc status 0x%x\n", __func__, val);
-	if ((val == 0x20) || (val == 0x02)) {
-		pr_info("%s: open e-mark cable in\n", __func__);
-		ohio->emarker_flag = 1;
-	}
-
-	ohio_debug_dump();
-	
-	if (ohio->pmode == MODE_DFP && usb_lock_host_speed)
-		dfp_downgrade_usb20();
-	if (ohio->pmode == MODE_UFP && usb_lock_speed)
-		ufp_switch_usb_speed(0);
 exit:
 	pr_debug("%s: exit\n", __func__);
 }
@@ -1179,12 +1139,14 @@ static void ohio_work_func(struct work_struct *work)
 	struct ohio_data *td = container_of(work, struct ohio_data,
 					       work.work);
 	uint fake_irq_triggerred = 0;
+	u8 val;
 
 	cable_connected = confirmed_cable_det(td);
 	pr_info("%s : detect cable insertion/remove, cable_connected = %d\n",
 				__func__, cable_connected);
 	if (cable_connected == DONGLE_CABLE_INSERT) {
 		
+		td->fake_irq_counter = 0;
 		mutex_lock(&td->lock);
 		ohio_main_process();
 		mutex_unlock(&td->lock);
@@ -1206,8 +1168,14 @@ static void ohio_work_func(struct work_struct *work)
 		if (atomic_read(&cbl_det_irq_status)) {
 			atomic_set(&cbl_det_irq_status, 0);
 			enable_irq(td->cbl_det_irq);
+			pr_info("%s: Enable cbl_det IRQ\n", __func__);
+			mdelay(1);
+			if ((cable_connected != DONGLE_CABLE_REMOVE) &&
+				((val = gpio_get_value(td->pdata->gpio_cbl_det)) == DONGLE_CABLE_REMOVE)) {
+				pr_info("%s: cable might be removed. do disconnect\n", __func__);
+				cable_disconnect(td);
+			}
 		}
-		pr_info("%s: Enable cbl_det IRQ\n", __func__);
 	}
 }
 
@@ -1236,6 +1204,52 @@ static void ohio_debounce_work_func(struct work_struct *work)
 	}
 	pr_info("%s : Enable cbl_det IRQ due to fake interrupt\n", __func__);
 }
+
+int workable_charging_cable(void)
+{
+	u8 val;
+	int ret;
+	struct ohio_data *ohio = NULL;
+
+	if(ohio_client)
+		ohio = i2c_get_clientdata(ohio_client);
+	else
+		return -ENODEV;
+
+	if (atomic_read(&ohio_power_status) == 1) {
+		ret = ohio_read_reg(OHIO_SLVAVE_I2C_ADDR, NEW_CC_STATUS, &val);
+		if (ret < 0) {
+			pr_err("%s: i2c fail\n", __func__);
+			return 2;
+		}
+		else {
+			pr_info("%s: cc_status = 0x%02X\n", __func__, val);
+			switch (val) {
+				case 0x00:
+					pr_err("%s: cable out\n", __func__);
+					return -1;
+				case 0x04:
+				case 0x40:
+				case 0x08:
+				case 0x80:
+					pr_info("%s: workable cable\n", __func__);
+					return 1;
+				case 0x0c:
+				case 0xc0:
+					pr_err("%s: illegal cable\n", __func__);
+					return 0;
+				default:
+					pr_err("%s: unknown status\n", __func__);
+					return -1;
+			}
+		}
+	}
+	else {
+		pr_info("%s: power not ready\n", __func__);
+		return 2;
+	}
+}
+EXPORT_SYMBOL(workable_charging_cable);
 
 #ifdef CONFIG_OF
 int __maybe_unused ohio_regulator_configure(struct device *dev,

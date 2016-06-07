@@ -326,6 +326,10 @@ module_param_named(
 	sram_update_period_ms, fg_sram_update_period_ms, int, S_IRUSR | S_IWUSR
 );
 
+#ifdef CONFIG_HTC_BATT
+static bool g_is_ima_error_handling = false;
+#endif 
+
 struct fg_irq {
 	int			irq;
 	unsigned long		disabled;
@@ -1293,6 +1297,9 @@ static void fg_check_ima_error_handling(struct fg_chip *chip)
 	fg_enable_irqs(chip, false);
 	chip->use_last_cc_soc = true;
 	chip->ima_error_handling = true;
+#ifdef CONFIG_HTC_BATT
+	g_is_ima_error_handling = true;
+#endif 
 	schedule_delayed_work(&chip->ima_error_recovery_work,
 		msecs_to_jiffies(0));
 	mutex_unlock(&chip->ima_recovery_lock);
@@ -2096,6 +2103,13 @@ static int get_system_soc(struct fg_chip *chip)
 	return soc;
 }
 #endif
+
+#ifdef CONFIG_HTC_BATT
+bool get_ima_error_status(void)
+{
+	return g_is_ima_error_handling;
+}
+#endif 
 
 #define EMPTY_CAPACITY		0
 #define DEFAULT_CAPACITY	50
@@ -6885,6 +6899,9 @@ out:
 	schedule_delayed_work(&chip->check_sanity_work,
 			msecs_to_jiffies(1000));
 	chip->ima_error_handling = false;
+#ifdef CONFIG_HTC_BATT
+	g_is_ima_error_handling = false;
+#endif 
 	mutex_unlock(&chip->ima_recovery_lock);
 	fg_relax(&chip->fg_reset_wakeup_source);
 	pr_info("ima_error_recovery_work end\n");

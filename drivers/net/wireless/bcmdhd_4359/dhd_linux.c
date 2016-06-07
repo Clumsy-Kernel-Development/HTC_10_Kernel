@@ -5636,16 +5636,7 @@ dhd_open_retry:
 #endif 
 		}
 #if defined(BCMPCIE) && defined(DHDTCPACK_SUPPRESS)
-#if defined(SET_RPS_CPUS)
 		dhd_tcpack_suppress_set(&dhd->pub, TCPACK_SUP_OFF);
-#else
-		if (dhd->pub.op_mode & DHD_FLAG_HOSTAP_MODE) {
-			DHD_ERROR(("%s : set ack suppress. TCPACK_SUP_OFF.\n", __FUNCTION__));
-			dhd_tcpack_suppress_set(&dhd->pub, TCPACK_SUP_OFF);
-		} else {
-			dhd_tcpack_suppress_set(&dhd->pub, TCPACK_SUP_HOLD);
-		}
-#endif
 #endif 
 #if defined(DHD_LB) && defined(DHD_LB_RXP)
 		if (dhd->rx_napi_netdev == NULL) {
@@ -6641,8 +6632,6 @@ dhd_attach(osl_t *osh, struct dhd_bus *bus, uint bus_hdrlen)
 #elif defined(BCMPCIE)
 #if defined(SET_RPS_CPUS)
 	dhd_tcpack_suppress_set(&dhd->pub, TCPACK_SUP_OFF);
-#else
-	dhd_tcpack_suppress_set(&dhd->pub, TCPACK_SUP_HOLD);
 #endif
 #else
 	dhd_tcpack_suppress_set(&dhd->pub, TCPACK_SUP_OFF);
@@ -13341,6 +13330,37 @@ int dhd_irq_affinity_enable(struct net_device *net, int enable)
 
 	return 0;
 }
+
+int dhd_tcpack_suppress_dynamic_enable(struct net_device *net, int enable)
+{
+	dhd_info_t *dhd = DHD_DEV_INFO(net);
+	dhd_if_t *ifp;
+	int ifidx;
+	ifidx = dhd_net2idx(dhd, net);
+	if (ifidx == DHD_BAD_IF) {
+		DHD_ERROR(("%s bad ifidx\n", __FUNCTION__));
+		return -ENODEV;
+	}
+	ifp = dhd->iflist[ifidx];
+	if (ifp) {
+		if (enable) {
+			DHD_TRACE(("%s : set ack suppress. TCPACK_SUP_HOLD.\n", __FUNCTION__));
+			if (dhd->pub.tcpack_sup_mode != TCPACK_SUP_HOLD) {
+				dhd_tcpack_suppress_set(&dhd->pub, TCPACK_SUP_HOLD);
+			}
+		} else {
+			DHD_TRACE(("%s : clear ack suppress.\n", __FUNCTION__));
+			if (dhd->pub.tcpack_sup_mode != TCPACK_SUP_OFF) {
+				dhd_tcpack_suppress_set(&dhd->pub, TCPACK_SUP_OFF);
+			}
+		}
+	} else {
+		DHD_ERROR(("%s : ifp is NULL!!\n", __FUNCTION__));
+		return -ENODEV;
+	}
+	return BCME_OK;
+}
+
 #endif 
 
 #if defined(SET_RPS_CPUS)
