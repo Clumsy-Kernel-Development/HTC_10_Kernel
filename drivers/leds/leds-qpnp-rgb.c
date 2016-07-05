@@ -32,10 +32,6 @@
 #include <linux/fb.h>
 #endif
 
-#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-#include <linux/alarmtimer.h>
-#endif
-
 #define LED_TRIGGER_DEFAULT		"none"
 
 #define RGB_LED_SRC_SEL(base)		(base + 0x45)
@@ -308,245 +304,14 @@ static void virtual_key_lut_table_set(int *virtual_key_lut_table, int array_len,
 
 	if (target_pwm > last_pwm) {
 		pwm_diff = target_pwm - last_pwm;
-		for(i = 1;i < array_len - 1;i++) {
+		for(i = 1;i < array_len - 1;i++)
 			virtual_key_lut_table[i] = virtual_key_lut_table[0] + (pwm_diff * (100 - base_pwm) / 255) * i / (array_len - 1);
-			LED_INFO("%s, up - index = %d value: %d\n", __func__, i, virtual_key_lut_table[i]);
-		}
 	} else {
 		pwm_diff = last_pwm - target_pwm;
-		for(i = 1;i < array_len - 1;i++) {
+		for(i = 1;i < array_len - 1;i++)
 			virtual_key_lut_table[i] = virtual_key_lut_table[0] - (pwm_diff * (100 - base_pwm) / 255) * i / (array_len - 1);
-			LED_INFO("%s, down - index = %d value: %d\n", __func__, i, virtual_key_lut_table[i]);
-		}
 	}
 }
-
-#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-static DEFINE_MUTEX(blinkstopworklock);
-static struct alarm blinkstopfunc_rtc;
-
-#define VIRTUAL_RAMP_SETP_TIME_BLINK_SLOW	110
-
-#define BUTTON_BLINK_SPEED_MAX	9
-
-#define BUTTON_BLINK_NUMBER_MAX	50
-#define BUTTON_BLINK_NUMBER_DEFAULT	15
-
-static int bln_switch = 1;
-static int bln_speed = 3;
-static int bln_number = BUTTON_BLINK_NUMBER_DEFAULT; // infinite = 0
-static int bln_notif_once = 0; // determines if while blinking, restart or not blinking (and blink off callback timer). Useful with non 0 bln_number setup.
-
-static int screen_on = 1;
-static int blinking = 0;
-struct qpnp_led_data *buttonled;
-
-
-static int qpnp_buttonled_blink_with_alarm(int on,int cancel_alarm);
-static int qpnp_buttonled_blink(int on);
-
-
-static enum alarmtimer_restart blinkstop_rtc_callback(struct alarm *al, ktime_t now) 
-{
-	LED_INFO("%s step trylock\n",__func__);
-	if (!mutex_trylock(&blinkstopworklock)) {
-		LED_INFO("%s step trylock failed, return \n",__func__);
-		return ALARMTIMER_NORESTART;
-	}
-	LED_INFO("%s step trylock success \n",__func__);
-
-	LED_INFO("%s step unblink? .... blinking %d && !screen_on  %d \n",__func__, blinking, !screen_on);
-	if (blinking && !screen_on) {
-		LED_INFO("%s step unblink! 0\n",__func__);
-		qpnp_buttonled_blink_with_alarm(0,0); // don't let cancel alarm happen, this is the alarm thread!
-	}
-
-	mutex_unlock(&blinkstopworklock);
-
-        return ALARMTIMER_NORESTART;
-}
-
-
-
-static int qpnp_mpp_blink(struct qpnp_led_data *led, int blink_brightness, int cancel_alarm)
-{
-	int rc;
-	u8 val;
-	int virtual_key_lut_table_stop[1] = {0};
-	int virtual_key_lut_table_blink[VIRTUAL_LUT_LEN] = {0,1,2,4,5,6,7,8,9,10};
-	// if number of blinks is not infinite, and "notify with blink only once" is off (so each blink should restart process), set restart_blink true...
-	int restart_blink = bln_number>0 && bln_notif_once == 0;
-
-	LED_INFO("%s, name:%s, brightness = %d status: %d\n", __func__, led->cdev.name, blink_brightness, led->status);
-
-	if(virtual_key_led_ignore_flag)
-		return 0;
-
-	if (blink_brightness == led->last_brightness && restart_blink == 0) {
-		LED_INFO("%s, brightness no change and restart_blink mode false, return\n", __func__);
-		return 0;
-	}
-
-	// if blink brightness > 0 and not already blinking or "restart blink each time" is active then do the stuff...
-	if (blink_brightness && (blinking == 0 || restart_blink)) {
-		if (screen_on) return rc;
-		// lights on...
-		blinking = 1;
-		if (led->mpp_cfg->mpp_reg && !led->mpp_cfg->enable) {
-			rc = regulator_set_voltage(led->mpp_cfg->mpp_reg,
-					led->mpp_cfg->min_uV,
-					led->mpp_cfg->max_uV);
-			if (rc) {
-				dev_err(&led->spmi_dev->dev,
-					"Regulator voltage set failed rc=%d\n",
-									rc);
-				return rc;
-			}
-
-			rc = regulator_enable(led->mpp_cfg->mpp_reg);
-			if (rc) {
-				dev_err(&led->spmi_dev->dev,
-					"Regulator enable failed(%d)\n", rc);
-				goto err_reg_enable;
-			}
-		}
-
-		led->mpp_cfg->enable = true;
-
-		if (blink_brightness < led->mpp_cfg->min_brightness) {
-			dev_warn(&led->spmi_dev->dev,
-				"brightness is less than supported..." \
-				"set to minimum supported\n");
-			blink_brightness = led->mpp_cfg->min_brightness;
-		}
-
-		if (led->mpp_cfg->pwm_mode != MANUAL_MODE) {
-			if (!led->mpp_cfg->pwm_cfg->blinking) {
-				led->mpp_cfg->pwm_cfg->mode =
-					led->mpp_cfg->pwm_cfg->default_mode;
-				led->mpp_cfg->pwm_mode =
-					led->mpp_cfg->pwm_cfg->default_mode;
-			}
-		}
-
-		if (led->mpp_cfg->pwm_mode == LPG_MODE) {
-
-			int pause_hi = 20;
-			int pause_lo = (8600 - (900 * bln_speed)) + 200;
-
-			if (bln_number > 0) { // if blink number is not infinite, schedule work
-				if (!mutex_is_locked(&blinkstopworklock)) {
-					int sleeptime = ( ((VIRTUAL_RAMP_SETP_TIME_BLINK_SLOW * (VIRTUAL_LUT_LEN)) * 2) + pause_hi + pause_lo) * bln_number;
-
-					ktime_t wakeup_time;
-					ktime_t curr_time = { .tv64 = 0 };
-					wakeup_time = ktime_add_us(curr_time,
-						(sleeptime * 1000LL)); // msec to usec
-					if (cancel_alarm) {
-						alarm_cancel(&blinkstopfunc_rtc); // stop pending alarm...
-						alarm_start_relative(&blinkstopfunc_rtc, wakeup_time); // start new...
-					}
-					LED_INFO("%s: Current Time tv_sec: %ld, Alarm set to tv_sec: %ld\n",
-						__func__,
-						ktime_to_timeval(curr_time).tv_sec,
-						ktime_to_timeval(wakeup_time).tv_sec);
-				}
-			}
-			led->mpp_cfg->pwm_cfg->lut_params.flags = PM_PWM_LUT_LOOP | PM_PWM_LUT_RAMP_UP | PM_PWM_LUT_REVERSE | PM_PWM_LUT_RAMP_UP | PM_PWM_LUT_PAUSE_HI_EN | PM_PWM_LUT_PAUSE_LO_EN;
-			led->mpp_cfg->pwm_cfg->lut_params.start_idx = VIRTUAL_LUT_START;
-			led->mpp_cfg->pwm_cfg->lut_params.idx_len = VIRTUAL_LUT_LEN;
-			led->mpp_cfg->pwm_cfg->lut_params.ramp_step_ms = VIRTUAL_RAMP_SETP_TIME_BLINK_SLOW;
-			led->mpp_cfg->pwm_cfg->lut_params.lut_pause_hi = pause_hi;
-			led->mpp_cfg->pwm_cfg->lut_params.lut_pause_lo = pause_lo;
-			led->last_brightness = blink_brightness;
-			rc = pwm_lut_config(led->mpp_cfg->pwm_cfg->pwm_dev,
-					PM_PWM_PERIOD_MIN,
-					virtual_key_lut_table_blink,
-					led->mpp_cfg->pwm_cfg->lut_params);
-		}
-
-		if (led->mpp_cfg->pwm_mode != MANUAL_MODE)
-			pwm_enable(led->mpp_cfg->pwm_cfg->pwm_dev);
-
-		val = (led->mpp_cfg->source_sel & LED_MPP_SRC_MASK) |
-			(led->mpp_cfg->mode_ctrl & LED_MPP_MODE_CTRL_MASK);
-
-		rc = qpnp_led_masked_write(led,
-			LED_MPP_MODE_CTRL(led->base), LED_MPP_MODE_MASK,
-			val);
-		if (rc) {
-			dev_err(&led->spmi_dev->dev,
-					"Failed to write led mode reg\n");
-			goto err_mpp_reg_write;
-		}
-
-		rc = qpnp_led_masked_write(led,
-				LED_MPP_EN_CTRL(led->base), LED_MPP_EN_MASK,
-				LED_MPP_EN_ENABLE);
-		if (rc) {
-			dev_err(&led->spmi_dev->dev,
-					"Failed to write led enable " \
-					"reg\n");
-			goto err_mpp_reg_write;
-		}
-
-	} else {
-		// lights down
-		blinking = 0;
-		if (cancel_alarm) {
-			alarm_cancel(&blinkstopfunc_rtc);
-		}
-		if (led->mpp_cfg->pwm_mode == LPG_MODE) {
-			led->mpp_cfg->pwm_cfg->lut_params.flags = PM_PWM_LUT_RAMP_UP;
-			led->mpp_cfg->pwm_cfg->lut_params.start_idx = VIRTUAL_LUT_START;
-			led->mpp_cfg->pwm_cfg->lut_params.idx_len = 1;
-			led->mpp_cfg->pwm_cfg->lut_params.ramp_step_ms = VIRTUAL_RAMP_SETP_TIME;
-			led->mpp_cfg->pwm_cfg->lut_params.lut_pause_hi = 0;
-			led->mpp_cfg->pwm_cfg->lut_params.lut_pause_lo = 0;
-			led->last_brightness = blink_brightness;
-			rc = pwm_lut_config(led->mpp_cfg->pwm_cfg->pwm_dev,
-					PM_PWM_PERIOD_MIN,
-					virtual_key_lut_table_stop,
-					led->mpp_cfg->pwm_cfg->lut_params);
-			pwm_enable(led->mpp_cfg->pwm_cfg->pwm_dev);
-			queue_delayed_work(g_led_work_queue, &led->fade_delayed_work,
-				msecs_to_jiffies(led->mpp_cfg->pwm_cfg->lut_params.ramp_step_ms * led->mpp_cfg->pwm_cfg->lut_params.idx_len));
-		}
-	}
-
-	if (led->mpp_cfg->pwm_mode != MANUAL_MODE)
-		led->mpp_cfg->pwm_cfg->blinking = false;
-	qpnp_dump_regs(led, mpp_debug_regs, ARRAY_SIZE(mpp_debug_regs));
-
-	return 0;
-
-err_mpp_reg_write:
-	if (led->mpp_cfg->mpp_reg)
-		regulator_disable(led->mpp_cfg->mpp_reg);
-err_reg_enable:
-	if (led->mpp_cfg->mpp_reg)
-		regulator_set_voltage(led->mpp_cfg->mpp_reg, 0,
-							led->mpp_cfg->max_uV);
-	led->mpp_cfg->enable = false;
-
-	return rc;
-
-
-}
-
-static int qpnp_buttonled_blink_with_alarm(int on, int cancel_alarm)
-{
-	LED_INFO("%s, on = %d cancel_alarm = %d \n", __func__, on, cancel_alarm);
-	return qpnp_mpp_blink(buttonled,on>0?10:0, cancel_alarm);
-}
-
-static int qpnp_buttonled_blink(int on)
-{
-	LED_INFO("%s, on = %d \n", __func__, on);
-	return qpnp_buttonled_blink_with_alarm(on>0?10:0, 1);
-}
-
-#endif
 
 static int qpnp_mpp_set(struct qpnp_led_data *led)
 {
@@ -556,10 +321,6 @@ static int qpnp_mpp_set(struct qpnp_led_data *led)
 	int virtual_key_lut_table[VIRTUAL_LUT_LEN] = {0};
 
 	LED_INFO("%s, name:%s, brightness = %d status: %d\n", __func__, led->cdev.name, led->cdev.brightness, led->status);
-
-#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-	blinking = 0;
-#endif
 
 	if(virtual_key_led_ignore_flag)
 		return 0;
@@ -599,7 +360,6 @@ static int qpnp_mpp_set(struct qpnp_led_data *led)
 	}
 
 	if (led->cdev.brightness) {
-		// lights on...
 		if (led->mpp_cfg->mpp_reg && !led->mpp_cfg->enable) {
 			rc = regulator_set_voltage(led->mpp_cfg->mpp_reg,
 					led->mpp_cfg->min_uV,
@@ -720,7 +480,6 @@ static int qpnp_mpp_set(struct qpnp_led_data *led)
 			goto err_mpp_reg_write;
 		}
 	} else {
-		// lights down
 		if (led->mpp_cfg->pwm_mode == LPG_MODE) {
 			led->mpp_cfg->pwm_cfg->lut_params.flags = PM_PWM_LUT_RAMP_UP;
 			led->mpp_cfg->pwm_cfg->lut_params.start_idx = VIRTUAL_LUT_START;
@@ -909,12 +668,6 @@ static int qpnp_rgb_set(struct qpnp_led_data *led)
 {
 	int rc;
 	LED_INFO("%s, name:%s, brightness = %d status: %d\n", __func__, led->cdev.name, led->cdev.brightness, led->status);
-
-#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-	if (!screen_on && blinking && led!=buttonled) {
-		qpnp_buttonled_blink(0);
-	}
-#endif
 
 	if (led->rgb_cfg->pwm_cfg->mode == RGB_MODE_LPG) {
 		cancel_delayed_work(&led->fade_delayed_work);
@@ -1609,11 +1362,6 @@ static ssize_t blink_store(struct device *dev,
 	led = container_of(led_cdev, struct qpnp_led_data, cdev);
 	led->cdev.brightness = blinking ? led->cdev.max_brightness : 0;
 
-#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-	if (bln_switch || blinking==0) {
-		qpnp_buttonled_blink(blinking);
-	}
-#endif
 	switch (led->id) {
 	case QPNP_ID_LED_MPP:
 			mpp_blink(led, led->mpp_cfg->pwm_cfg);
@@ -2345,11 +2093,6 @@ static int led_multicolor_short_blink(struct qpnp_led_data *led, int pwm_coeffic
 	rc = pwm_enable(led->rgb_cfg->pwm_cfg->pwm_dev);
 	led->status = ON;
 	led->rgb_cfg->pwm_cfg->blinking = true;
-#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-	if (bln_switch) {
-		qpnp_buttonled_blink(1);
-	}
-#endif
 	qpnp_dump_regs(led, rgb_pwm_debug_regs, ARRAY_SIZE(rgb_pwm_debug_regs));
 	return rc;
 }
@@ -2400,11 +2143,6 @@ static int led_multicolor_long_blink(struct qpnp_led_data *led, int pwm_coeffici
 	rc = pwm_enable(led->rgb_cfg->pwm_cfg->pwm_dev);
 	led->status = ON;
 	led->rgb_cfg->pwm_cfg->blinking = true;
-#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-	if (bln_switch) {
-		qpnp_buttonled_blink(1);
-	}
-#endif
 	qpnp_dump_regs(led, rgb_pwm_debug_regs, ARRAY_SIZE(rgb_pwm_debug_regs));
 	return rc;
 }
@@ -2417,7 +2155,7 @@ static int lpg_blink(struct led_classdev *led_cdev, int val)
 
 	led = container_of(led_cdev, struct qpnp_led_data, cdev);
 
-	LED_INFO("%s: bank %d blink %d status %d coefficient calc %d \n", __func__, led->id, val, led->status, (640 * led->rgb_cfg->pwm_cfg->pwm_coefficient / 255));
+	LED_DBG("%s: bank %d blink %d status %d\n", __func__, led->id, val, led->status);
 
 	switch (val) {
 	case BLINK_STOP:
@@ -2744,142 +2482,6 @@ static ssize_t led_off_timer_store(struct device *dev,
 }
 static DEVICE_ATTR(off_timer, 0644, NULL, led_off_timer_store);
 
-#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-
-static ssize_t bln_show(struct device *dev,
-            struct device_attribute *attr, char *buf)
-{
-      return snprintf(buf, PAGE_SIZE, "%d\n", bln_switch);
-}
-
-static ssize_t bln_dump(struct device *dev,
-            struct device_attribute *attr, const char *buf, size_t count)
-{
-      int ret;
-      unsigned long input;
-
-      ret = kstrtoul(buf, 0, &input);
-      if (ret < 0)
-            return ret;
-
-      if (input < 0 || input > 1)
-            input = 0;
-
-      bln_switch = input;
-
-      return count;
-}
-
-static DEVICE_ATTR(bln, (S_IWUSR|S_IRUGO),
-      bln_show, bln_dump);
-
-
-static ssize_t bln_speed_show(struct device *dev,
-            struct device_attribute *attr, char *buf)
-{
-      return snprintf(buf, PAGE_SIZE, "%d\n", bln_speed);
-}
-
-static ssize_t bln_speed_dump(struct device *dev,
-            struct device_attribute *attr, const char *buf, size_t count)
-{
-      int ret;
-      unsigned long input;
-
-      ret = kstrtoul(buf, 0, &input);
-      if (ret < 0)
-            return ret;
-
-      if (input < 0 || input > BUTTON_BLINK_SPEED_MAX)
-            input = 8;
-
-      bln_speed = input;
-
-      return count;
-}
-
-static DEVICE_ATTR(bln_speed, (S_IWUSR|S_IRUGO),
-      bln_speed_show, bln_speed_dump);
-
-static ssize_t bln_speed_max_show(struct device *dev,
-            struct device_attribute *attr, char *buf)
-{
-      return snprintf(buf, PAGE_SIZE, "%d\n", BUTTON_BLINK_SPEED_MAX);
-}
-
-static ssize_t bln_speed_max_dump(struct device *dev,
-            struct device_attribute *attr, const char *buf, size_t count)
-{
-      int ret;
-      unsigned long input;
-
-      ret = kstrtoul(buf, 0, &input);
-      if (ret < 0)
-            return ret;
-
-      if (input < 0 || input > BUTTON_BLINK_SPEED_MAX)
-            input = 8;
-
-      return count;
-}
-
-static DEVICE_ATTR(bln_speed_max, (S_IWUSR|S_IRUGO),
-      bln_speed_max_show, bln_speed_max_dump);
-
-
-static ssize_t bln_number_show(struct device *dev,
-            struct device_attribute *attr, char *buf)
-{
-      return snprintf(buf, PAGE_SIZE, "%d\n", bln_number);
-}
-
-static ssize_t bln_number_dump(struct device *dev,
-            struct device_attribute *attr, const char *buf, size_t count)
-{
-      int ret;
-      unsigned long input;
-
-      ret = kstrtoul(buf, 0, &input);
-      if (ret < 0)
-            return ret;
-
-      if (input < 0 || input > BUTTON_BLINK_NUMBER_MAX)
-            input = BUTTON_BLINK_NUMBER_DEFAULT;
-
-      bln_number = input;
-
-      return count;
-}
-
-static DEVICE_ATTR(bln_number, (S_IWUSR|S_IRUGO),
-      bln_number_show, bln_number_dump);
-
-
-static ssize_t bln_number_max_show(struct device *dev,
-            struct device_attribute *attr, char *buf)
-{
-      return snprintf(buf, PAGE_SIZE, "%d\n", BUTTON_BLINK_NUMBER_MAX);
-}
-
-static ssize_t bln_number_max_dump(struct device *dev,
-            struct device_attribute *attr, const char *buf, size_t count)
-{
-      int ret;
-      unsigned long input;
-
-      ret = kstrtoul(buf, 0, &input);
-      if (ret < 0)
-            return ret;
-
-      return count;
-}
-
-static DEVICE_ATTR(bln_number_max, (S_IWUSR|S_IRUGO),
-      bln_number_max_show, bln_number_max_dump);
-
-
-#endif
-
 
 static ssize_t pm8xxx_led_blink_show(struct device *dev,
                                         struct device_attribute *attr,
@@ -2907,11 +2509,6 @@ static ssize_t pm8xxx_led_blink_store(struct device *dev,
 	led->mode = val;
 	current_blink = val;
 	LED_INFO("%s: blink: %d\n", __func__, val);
-#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-	if (val==0 || bln_switch) {
-		qpnp_buttonled_blink(val);
-	}
-#endif
 	switch(led->id) {
 		case QPNP_ID_LED_MPP:
 			led->mpp_cfg->blink_mode = val;
@@ -3219,10 +2816,7 @@ static int fb_notifier_callback(struct notifier_block *self,
         blank = evdata->data;
         switch (*blank) {
         case FB_BLANK_UNBLANK:
-#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-		screen_on = 1;
-		alarm_cancel(&blinkstopfunc_rtc);
-#endif
+			
             break;
 
         case FB_BLANK_POWERDOWN:
@@ -3230,9 +2824,6 @@ static int fb_notifier_callback(struct notifier_block *self,
         case FB_BLANK_VSYNC_SUSPEND:
         case FB_BLANK_NORMAL:
             
-#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-		screen_on = 0;
-#endif
             if(g_led_virtual->cdev.brightness) {
 				g_led_virtual->cdev.brightness = 0;
                 qpnp_mpp_set(g_led_virtual);
@@ -3311,9 +2902,6 @@ static int qpnp_leds_probe(struct spmi_device *spmi)
 				LED_INFO("button-backlight not use power source 0x%04x\n", led->base);
 				goto fail_id_check;
 			}
-#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-			buttonled = led;
-#endif
 		}
 #endif
 		if(strcmp(led->cdev.name, "indicator") == 0){
@@ -3521,13 +3109,6 @@ static int qpnp_leds_probe(struct spmi_device *spmi)
 				rc = device_create_file(led->cdev.dev, &dev_attr_blink);
 				rc = device_create_file(led->cdev.dev, &dev_attr_pwm_coefficient);
 				rc = device_create_file(led->cdev.dev, &dev_attr_current_set);
-#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-				rc = device_create_file(led->cdev.dev, &dev_attr_bln);
-				rc = device_create_file(led->cdev.dev, &dev_attr_bln_speed);
-				rc = device_create_file(led->cdev.dev, &dev_attr_bln_number);
-				rc = device_create_file(led->cdev.dev, &dev_attr_bln_number_max);
-				rc = device_create_file(led->cdev.dev, &dev_attr_bln_speed_max);
-#endif
 				rc = device_create_file(led->cdev.dev, &dev_attr_set_color_ID);
 				if (rc < 0) {
 					LED_ERR("%s: Failed to create %s attr blink\n", __func__,  led->cdev.name);
@@ -3541,11 +3122,6 @@ static int qpnp_leds_probe(struct spmi_device *spmi)
 					INIT_WORK(&led->led_off_work, led_off_work_func); 
 				}
 				INIT_DELAYED_WORK(&led->blink_delayed_work, led_blink_do_work);
-
-#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-				alarm_init(&blinkstopfunc_rtc, ALARM_REALTIME,
-					blinkstop_rtc_callback);
-#endif
 			}
 		}
 
