@@ -323,23 +323,27 @@ static void virtual_key_lut_table_set(int *virtual_key_lut_table, int array_len,
 
 #ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
 static DEFINE_MUTEX(blinkstopworklock);
+static DEFINE_MUTEX(blinkworklock);
 static struct alarm blinkstopfunc_rtc;
 
 #define VIRTUAL_RAMP_SETP_TIME_BLINK_SLOW	110
+#define VIRTUAL_RAMP_SETP_TIME_DOUBLE_BLINK_SLOW	90
 
 #define BUTTON_BLINK_SPEED_MAX	9
+#define BUTTON_BLINK_SPEED_DEFAULT	5
 
 #define BUTTON_BLINK_NUMBER_MAX	50
-#define BUTTON_BLINK_NUMBER_DEFAULT	15
+#define BUTTON_BLINK_NUMBER_DEFAULT	20
 
 static int bln_switch = 1;
-static int bln_speed = 3;
+static int bln_speed = BUTTON_BLINK_SPEED_DEFAULT;
 static int bln_number = BUTTON_BLINK_NUMBER_DEFAULT; // infinite = 0
-static int bln_notif_once = 0; // determines if while blinking, restart or not blinking (and blink off callback timer). Useful with non 0 bln_number setup.
 
 static int screen_on = 1;
 static int blinking = 0;
 struct qpnp_led_data *buttonled;
+static int charging = 0;
+static int short_vib_notif = 0;
 
 
 static int qpnp_buttonled_blink_with_alarm(int on,int cancel_alarm);
@@ -374,22 +378,29 @@ static int qpnp_mpp_blink(struct qpnp_led_data *led, int blink_brightness, int c
 	u8 val;
 	int virtual_key_lut_table_stop[1] = {0};
 	int virtual_key_lut_table_blink[VIRTUAL_LUT_LEN] = {0,1,2,4,5,6,7,8,9,10};
-	// if number of blinks is not infinite, and "notify with blink only once" is off (so each blink should restart process), set restart_blink true...
-	int restart_blink = bln_number>0 && bln_notif_once == 0;
+	int virtual_key_lut_table_double_blink[VIRTUAL_LUT_LEN] = {0,1,3,6,8,10,8,5,3,1};
 
 	LED_INFO("%s, name:%s, brightness = %d status: %d\n", __func__, led->cdev.name, blink_brightness, led->status);
 
 	if(virtual_key_led_ignore_flag)
 		return 0;
 
-	if (blink_brightness == led->last_brightness && restart_blink == 0) {
-		LED_INFO("%s, brightness no change and restart_blink mode false, return\n", __func__);
+	if (blink_brightness == led->last_brightness && blink_brightness == 0) {
+		LED_INFO("%s, brightness 0 and no change, return\n", __func__);
 		return 0;
 	}
 
-	// if blink brightness > 0 and not already blinking or "restart blink each time" is active then do the stuff...
-	if (blink_brightness && (blinking == 0 || restart_blink)) {
-		if (screen_on) return rc;
+	// lock started...
+	if (!mutex_trylock(&blinkworklock)) {
+		LED_INFO("%s step trylock failed, return \n",__func__);
+		return 0;
+	}
+
+	if (blink_brightness>0) {
+		if (screen_on) {
+			mutex_unlock(&blinkworklock);
+			return rc;
+		}
 		// lights on...
 		blinking = 1;
 		if (led->mpp_cfg->mpp_reg && !led->mpp_cfg->enable) {
@@ -400,6 +411,7 @@ static int qpnp_mpp_blink(struct qpnp_led_data *led, int blink_brightness, int c
 				dev_err(&led->spmi_dev->dev,
 					"Regulator voltage set failed rc=%d\n",
 									rc);
+				mutex_unlock(&blinkworklock);
 				return rc;
 			}
 
@@ -434,9 +446,9 @@ static int qpnp_mpp_blink(struct qpnp_led_data *led, int blink_brightness, int c
 			int pause_hi = 20;
 			int pause_lo = (8600 - (900 * bln_speed)) + 200;
 
-			if (bln_number > 0) { // if blink number is not infinite, schedule work
+			if (bln_number > 0 && !charging) { // if blink number is not infinite and is not charging, schedule CANCEL work
 				if (!mutex_is_locked(&blinkstopworklock)) {
-					int sleeptime = ( ((VIRTUAL_RAMP_SETP_TIME_BLINK_SLOW * (VIRTUAL_LUT_LEN)) * 2) + pause_hi + pause_lo) * bln_number;
+					int sleeptime = ( (((short_vib_notif?(VIRTUAL_RAMP_SETP_TIME_DOUBLE_BLINK_SLOW+11):VIRTUAL_RAMP_SETP_TIME_BLINK_SLOW) * (VIRTUAL_LUT_LEN)) * 2) + pause_hi + pause_lo) * bln_number;
 
 					ktime_t wakeup_time;
 					ktime_t curr_time = { .tv64 = 0 };
@@ -455,14 +467,16 @@ static int qpnp_mpp_blink(struct qpnp_led_data *led, int blink_brightness, int c
 			led->mpp_cfg->pwm_cfg->lut_params.flags = PM_PWM_LUT_LOOP | PM_PWM_LUT_RAMP_UP | PM_PWM_LUT_REVERSE | PM_PWM_LUT_RAMP_UP | PM_PWM_LUT_PAUSE_HI_EN | PM_PWM_LUT_PAUSE_LO_EN;
 			led->mpp_cfg->pwm_cfg->lut_params.start_idx = VIRTUAL_LUT_START;
 			led->mpp_cfg->pwm_cfg->lut_params.idx_len = VIRTUAL_LUT_LEN;
-			led->mpp_cfg->pwm_cfg->lut_params.ramp_step_ms = VIRTUAL_RAMP_SETP_TIME_BLINK_SLOW;
+			led->mpp_cfg->pwm_cfg->lut_params.ramp_step_ms = (short_vib_notif?VIRTUAL_RAMP_SETP_TIME_DOUBLE_BLINK_SLOW:VIRTUAL_RAMP_SETP_TIME_BLINK_SLOW);
 			led->mpp_cfg->pwm_cfg->lut_params.lut_pause_hi = pause_hi;
 			led->mpp_cfg->pwm_cfg->lut_params.lut_pause_lo = pause_lo;
 			led->last_brightness = blink_brightness;
 			rc = pwm_lut_config(led->mpp_cfg->pwm_cfg->pwm_dev,
 					PM_PWM_PERIOD_MIN,
-					virtual_key_lut_table_blink,
+					// if short vib notif registered, use double blink! e.g. facebook messages, calendars give short vib notifs
+					short_vib_notif?virtual_key_lut_table_double_blink:virtual_key_lut_table_blink,
 					led->mpp_cfg->pwm_cfg->lut_params);
+			short_vib_notif = 0;
 		}
 
 		if (led->mpp_cfg->pwm_mode != MANUAL_MODE)
@@ -518,6 +532,8 @@ static int qpnp_mpp_blink(struct qpnp_led_data *led, int blink_brightness, int c
 		led->mpp_cfg->pwm_cfg->blinking = false;
 	qpnp_dump_regs(led, mpp_debug_regs, ARRAY_SIZE(mpp_debug_regs));
 
+	mutex_unlock(&blinkworklock);
+
 	return 0;
 
 err_mpp_reg_write:
@@ -528,6 +544,8 @@ err_reg_enable:
 		regulator_set_voltage(led->mpp_cfg->mpp_reg, 0,
 							led->mpp_cfg->max_uV);
 	led->mpp_cfg->enable = false;
+
+	mutex_unlock(&blinkworklock);
 
 	return rc;
 
@@ -546,6 +564,61 @@ static int qpnp_buttonled_blink(int on)
 	return qpnp_buttonled_blink_with_alarm(on>0?10:0, 1);
 }
 
+// register charging: this symbol function will register charging events from anywhere in kernel calls
+// e.g. from USB ohio driver
+void register_charging(int on)
+{
+	LED_INFO("%s %d\n",__func__,on);
+	charging = on>0?1:0;
+}
+EXPORT_SYMBOL(register_charging);
+
+// handling haptic notifications if enabled to register notifications even when RGB led is already blinking, or on charger
+static unsigned long last_haptic_jiffies = 0;
+static unsigned int last_value = 0;
+static unsigned int MAX_DIFF = 200;
+
+#define FINGERPRINT_VIB_TIME_EXCEPTION 40
+
+void register_haptic(int value)
+{
+	unsigned int diff_jiffies = jiffies - last_haptic_jiffies;
+	last_haptic_jiffies = jiffies;
+	LED_INFO("%s %d - jiffies diff %u \n",__func__,value, diff_jiffies);
+
+//	if this exceptional time is used, it means, fingerprint scanner vibrated with proxomity sensor detection on
+//	and with unregistered finger, so no wake event. In this case, don't start blinking, not a notif, just return
+	if (value == FINGERPRINT_VIB_TIME_EXCEPTION) return;
+
+	if (screen_on) return;
+	if (last_value == value) {
+		if (diff_jiffies < MAX_DIFF) {
+			if (value <= 200) {
+				short_vib_notif = 1;
+			} else {
+				short_vib_notif = 0;
+			}
+			qpnp_buttonled_blink(1);
+		}
+	}
+	last_value = value;
+}
+
+EXPORT_SYMBOL(register_haptic);
+
+#endif
+#ifndef CONFIG_LEDS_QPNP_BUTTON_BLINK
+void register_charging(int on)
+{
+	LED_INFO("%s %d\n",__func__,on);
+}
+EXPORT_SYMBOL(register_charging);
+
+void register_haptic(int value)
+{
+	LED_INFO("%s %d\n",__func__,value);
+}
+EXPORT_SYMBOL(register_haptic);
 #endif
 
 static int qpnp_mpp_set(struct qpnp_led_data *led)
@@ -911,7 +984,10 @@ static int qpnp_rgb_set(struct qpnp_led_data *led)
 	LED_INFO("%s, name:%s, brightness = %d status: %d\n", __func__, led->cdev.name, led->cdev.brightness, led->status);
 
 #ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-	if (!screen_on && blinking && led!=buttonled) {
+	// if charging this should be ignored, and not switch BLN off,
+	// because stock rom calls amber led rgb_set when charging even 
+	// when the notification was not yet canceled by User on screen.
+	if (!screen_on && blinking && led!=buttonled && !charging) {
 		qpnp_buttonled_blink(0);
 	}
 #endif
@@ -2791,7 +2867,7 @@ static ssize_t bln_speed_dump(struct device *dev,
             return ret;
 
       if (input < 0 || input > BUTTON_BLINK_SPEED_MAX)
-            input = 8;
+            input = BUTTON_BLINK_SPEED_DEFAULT;
 
       bln_speed = input;
 
